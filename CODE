@@ -1,0 +1,624 @@
+input_filename = [];
+
+% Default sampling frequency (used if file does not contain Fs)
+defaultFs = 360;
+
+% Adaptive filter length
+filterLength = 16;
+
+% Enable / disable algorithms
+run_LMS    = true;
+run_NLMS   = true;
+run_PNLMS  = true;
+run_IPNLMS = true;
+run_RLS    = true;
+run_Kalman = true;
+run_EEMD   = true;
+
+% EEMD parameters
+eemd_ensembles = 20;
+eemd_noise_level_factor = 0.2;
+
+% Composite score weights (must sum to 1 ideally)
+w_snr  = 0.30;
+w_prd  = 0.25;
+w_mse  = 0.15;
+w_corr = 0.20;
+w_time = 0.10;
+
+%% ======================================================
+
+%% ----------------- Load data -----------------
+if isempty(input_filename)
+    use_synthetic = true;
+else
+    use_synthetic = false;
+end
+
+if ~use_synthetic
+    try
+        [ecg_noisy, acc, Fs, time_vec, ecg_clean_user] = my_load_ecg_acc(input_filename, defaultFs);
+        fprintf('Loaded data file: %s (N=%d, Fs=%g Hz)\n', input_filename, length(ecg_noisy), Fs);
+        t = time_vec(:);
+        if isempty(t), t = (0:length(ecg_noisy)-1)'/Fs; end
+    catch ME
+        warning('Loading failed (%s). Falling back to synthetic generator.\nError: %s', input_filename, ME.message);
+        use_synthetic = true;
+    end
+end
+
+if use_synthetic
+    Fs = defaultFs;
+    dur = 12; t = (0:1/Fs:dur-1/Fs)'; 
+    fprintf('Using synthetic ECG generator (Fs=%g Hz, dur=%g s)\n', Fs, dur);
+    [ecg_clean_user, ecg_noisy, acc, t] = my_synthetic_ecg_with_motion(Fs, dur);
+    ecg_clean_user = ecg_clean_user(:);
+end
+
+N = length(ecg_noisy);
+ecg_noisy = ecg_noisy(:);
+acc = acc(:);
+if length(acc) ~= N
+    acc = my_resample_vector(acc, N);
+end
+
+% If user provided a clean reference, keep it; otherwise empty (we'll build surrogate)
+if exist('ecg_clean_user','var') && ~isempty(ecg_clean_user)
+    ecg_clean = ecg_clean_user(:);
+    have_clean = true;
+    if length(ecg_clean) ~= N
+        % Truncate or resample if needed (take min length)
+        Lmin = min(length(ecg_clean), N);
+        ecg_clean = ecg_clean(1:Lmin); ecg_noisy = ecg_noisy(1:Lmin); acc = acc(1:Lmin); t = t(1:Lmin); N = Lmin;
+    end
+else
+    ecg_clean = []; have_clean = false;
+end
+
+% If no clean reference, create surrogate clean (bandpass + median)
+if ~have_clean
+    fprintf('No ground-truth clean ECG found. Creating surrogate clean for metric calculation.\n');
+    surrogate = my_bandpass(ecg_noisy, [0.5 40], Fs);
+    surrogate = medfilt1(surrogate, round(0.06*Fs)); % median smoothing approx 60ms
+    ecg_clean = surrogate;
+    surrogate_flag = true;
+else
+    surrogate_flag = false;
+end
+
+% remove DC from acc reference
+acc = acc - mean(acc);
+
+%% ---------- Metric helpers ----------
+snr_calc = @(clean, est) 10*log10( sum(clean.^2) / (sum((est - clean).^2) + eps) );
+mse_calc = @(clean, est) mean((clean - est).^2);
+prd_calc = @(clean, est) sqrt(sum((clean - est).^2) / (sum(clean.^2) + eps)) * 100;
+corr_calc = @(clean, est) corr(clean, est);
+
+baseline_snr = snr_calc(ecg_clean, ecg_noisy);
+
+%% ---------- Prepare results container ----------
+results = struct();
+results.Original.clean = ecg_clean;
+results.Original.noisy = ecg_noisy;
+results.Original.Fs = Fs;
+results.Original.SNR_dB = baseline_snr;
+results.Original.MSE = mse_calc(ecg_clean, ecg_noisy);
+results.Original.PRD = prd_calc(ecg_clean, ecg_noisy);
+results.Original.CORR = corr_calc(ecg_clean, ecg_noisy);
+results.Original.TimeSec = 0;
+results.Info.surrogate_used = surrogate_flag;
+
+d = ecg_noisy;
+x_ref = acc;
+L = filterLength;
+
+%% ---------------- Run algorithms ----------------
+fprintf('Running algorithms (this may take a few seconds)...\n');
+
+% LMS
+if run_LMS
+    tic;
+    mu = 0.005;
+    [w_lms, y_lms, e_lms] = my_lms_adaptive(d, x_ref, L, mu);
+    t_lms = toc;
+    results.LMS.y = y_lms; results.LMS.time = t_lms;
+    results.LMS.SNR_dB = snr_calc(ecg_clean, y_lms);
+    results.LMS.SNRimprov_dB = results.LMS.SNR_dB - baseline_snr;
+    results.LMS.MSE = mse_calc(ecg_clean, y_lms);
+    results.LMS.PRD = prd_calc(ecg_clean, y_lms);
+    results.LMS.CORR = corr_calc(ecg_clean, y_lms);
+end
+
+% NLMS
+if run_NLMS
+    tic;
+    mu_n = 0.8; eps_nlms = 1e-6;
+    [y_nlms, w_nlms] = my_nlms_adaptive(d, x_ref, L, mu_n, eps_nlms);
+    t_nlms = toc;
+    results.NLMS.y = y_nlms; results.NLMS.time = t_nlms;
+    results.NLMS.SNR_dB = snr_calc(ecg_clean, y_nlms);
+    results.NLMS.SNRimprov_dB = results.NLMS.SNR_dB - baseline_snr;
+    results.NLMS.MSE = mse_calc(ecg_clean, y_nlms);
+    results.NLMS.PRD = prd_calc(ecg_clean, y_nlms);
+    results.NLMS.CORR = corr_calc(ecg_clean, y_nlms);
+end
+
+% PNLMS
+if run_PNLMS
+    tic;
+    mu_p = 0.8; rho = 0.01; delta = 1e-3;
+    [y_pnlms, w_pnlms] = my_pnlms_adaptive(d, x_ref, L, mu_p, rho, delta);
+    t_pnlms = toc;
+    results.PNLMS.y = y_pnlms; results.PNLMS.time = t_pnlms;
+    results.PNLMS.SNR_dB = snr_calc(ecg_clean, y_pnlms);
+    results.PNLMS.SNRimprov_dB = results.PNLMS.SNR_dB - baseline_snr;
+    results.PNLMS.MSE = mse_calc(ecg_clean, y_pnlms);
+    results.PNLMS.PRD = prd_calc(ecg_clean, y_pnlms);
+    results.PNLMS.CORR = corr_calc(ecg_clean, y_pnlms);
+end
+
+% IPNLMS
+if run_IPNLMS
+    tic;
+    mu_ip = 0.8; alpha = 0.0;
+    [y_ipnlms, w_ipnlms] = my_ipnlms_adaptive(d, x_ref, L, mu_ip, alpha, rho, delta);
+    t_ipnlms = toc;
+    results.IPNLMS.y = y_ipnlms; results.IPNLMS.time = t_ipnlms;
+    results.IPNLMS.SNR_dB = snr_calc(ecg_clean, y_ipnlms);
+    results.IPNLMS.SNRimprov_dB = results.IPNLMS.SNR_dB - baseline_snr;
+    results.IPNLMS.MSE = mse_calc(ecg_clean, y_ipnlms);
+    results.IPNLMS.PRD = prd_calc(ecg_clean, y_ipnlms);
+    results.IPNLMS.CORR = corr_calc(ecg_clean, y_ipnlms);
+end
+
+% RLS
+if run_RLS
+    tic;
+    lambda = 0.99; delta_rls = 0.1;
+    [y_rls, w_rls] = my_rls_adaptive(d, x_ref, L, lambda, delta_rls);
+    t_rls = toc;
+    results.RLS.y = y_rls; results.RLS.time = t_rls;
+    results.RLS.SNR_dB = snr_calc(ecg_clean, y_rls);
+    results.RLS.SNRimprov_dB = results.RLS.SNR_dB - baseline_snr;
+    results.RLS.MSE = mse_calc(ecg_clean, y_rls);
+    results.RLS.PRD = prd_calc(ecg_clean, y_rls);
+    results.RLS.CORR = corr_calc(ecg_clean, y_rls);
+end
+
+% Kalman
+if run_Kalman
+    tic;
+    q = 1e-5; rvar = 1e-3;
+    [y_kalman, w_kalman] = my_kalman_adaptive(d, x_ref, L, q, rvar);
+    t_kalman = toc;
+    results.Kalman.y = y_kalman; results.Kalman.time = t_kalman;
+    results.Kalman.SNR_dB = snr_calc(ecg_clean, y_kalman);
+    results.Kalman.SNRimprov_dB = results.Kalman.SNR_dB - baseline_snr;
+    results.Kalman.MSE = mse_calc(ecg_clean, y_kalman);
+    results.Kalman.PRD = prd_calc(ecg_clean, y_kalman);
+    results.Kalman.CORR = corr_calc(ecg_clean, y_kalman);
+end
+
+% EEMD-style denoiser
+if run_EEMD
+    tic;
+    noise_level = eemd_noise_level_factor * std(ecg_noisy);
+    y_eemd = my_simple_eemd_denoise(ecg_noisy, Fs, eemd_ensembles, noise_level);
+    t_eemd = toc;
+    results.EEMD.y = y_eemd; results.EEMD.time = t_eemd;
+    results.EEMD.SNR_dB = snr_calc(ecg_clean, y_eemd);
+    results.EEMD.SNRimprov_dB = results.EEMD.SNR_dB - baseline_snr;
+    results.EEMD.MSE = mse_calc(ecg_clean, y_eemd);
+    results.EEMD.PRD = prd_calc(ecg_clean, y_eemd);
+    results.EEMD.CORR = corr_calc(ecg_clean, y_eemd);
+end
+
+%% ---------------- Build comparison table ----------------
+% Methods to include (Original + those computed)
+methodList = {'Original','LMS','NLMS','PNLMS','IPNLMS','RLS','Kalman','EEMD'};
+rows = {};
+SNR_dB = []; SNR_improv = []; MSEv = []; PRDv = []; CORRv = []; Timev = [];
+
+for i = 1:length(methodList)
+    m = methodList{i};
+    rows{end+1} = m; %#ok<SAGROW>
+    if strcmp(m,'Original')
+        SNR_dB(end+1) = results.Original.SNR_dB; %#ok<SAGROW>
+        SNR_improv(end+1) = 0; %#ok<SAGROW>
+        MSEv(end+1) = results.Original.MSE; %#ok<SAGROW>
+        PRDv(end+1) = results.Original.PRD; %#ok<SAGROW>
+        CORRv(end+1) = results.Original.CORR; %#ok<SAGROW>
+        Timev(end+1) = results.Original.TimeSec; %#ok<SAGROW>
+    else
+        if isfield(results, m)
+            SNR_dB(end+1) = results.(m).SNR_dB; %#ok<SAGROW>
+            SNR_improv(end+1) = results.(m).SNRimprov_dB; %#ok<SAGROW>
+            MSEv(end+1) = results.(m).MSE; %#ok<SAGROW>
+            PRDv(end+1) = results.(m).PRD; %#ok<SAGROW>
+            CORRv(end+1) = results.(m).CORR; %#ok<SAGROW>
+            Timev(end+1) = results.(m).time; %#ok<SAGROW>
+        else
+            SNR_dB(end+1) = NaN; SNR_improv(end+1) = NaN; MSEv(end+1) = NaN;
+            PRDv(end+1) = NaN; CORRv(end+1) = NaN; Timev(end+1) = NaN;
+        end
+    end
+end
+
+compTable = table(SNR_dB.', SNR_improv.', MSEv.', PRDv.', CORRv.', Timev.', 'RowNames', rows, ...
+    'VariableNames', {'SNR_dB','SNR_improv_dB','MSE','PRD_percent','CORR','TimeSec'});
+
+fprintf('\nComparison table (SNR in dB, PRD in %%):\n');
+disp(compTable);
+
+% Save comparison table
+try
+    writetable(compTable, 'comparison_table.csv', 'WriteRowNames', true);
+    fprintf('Saved comparison_table.csv\n');
+catch
+    warning('Could not save comparison_table.csv');
+end
+
+%% ---------------- Ranking (composite score) ----------------
+% Exclude Original baseline from ranking
+alg_names = compTable.Properties.RowNames;
+isBaseline = strcmp(alg_names,'Original');
+alg_names_rank = alg_names(~isBaseline);
+
+SNR_improv_arr = compTable.SNR_improv_dB(~isBaseline);
+PRD_arr = compTable.PRD_percent(~isBaseline);
+MSE_arr = compTable.MSE(~isBaseline);
+CORR_arr = compTable.CORR(~isBaseline);
+Time_arr = compTable.TimeSec(~isBaseline);
+
+% Normalize to 0..1 (higher-is-better)
+norm01 = @(v) (v - min(v)) ./ (max(v) - min(v) + eps);
+s_snr = norm01(SNR_improv_arr);
+s_prd = 1 - norm01(PRD_arr);    % invert (lower better)
+s_mse = 1 - norm01(MSE_arr);
+s_corr = norm01(CORR_arr);
+s_time = 1 - norm01(Time_arr);
+
+composite = w_snr*s_snr + w_prd*s_prd + w_mse*s_mse + w_corr*s_corr + w_time*s_time;
+
+T_rank = table(alg_names_rank, SNR_improv_arr, PRD_arr, MSE_arr, CORR_arr, Time_arr, composite, ...
+    'VariableNames', {'Algorithm','SNR_improv_dB','PRD_percent','MSE','CORR','TimeSec','CompositeScore'});
+
+T_rank_sorted = sortrows(T_rank, 'CompositeScore', 'descend');
+T_rank_sorted = addvars(T_rank_sorted, (1:height(T_rank_sorted))','Before','Algorithm','NewVariableNames','Rank');
+
+fprintf('\nAlgorithm ranking (best -> least) based on composite score:\n');
+disp(T_rank_sorted);
+
+% Save ranking table
+try
+    writetable(T_rank_sorted, 'ranking_table.csv');
+    fprintf('Saved ranking_table.csv\n');
+catch
+    warning('Could not save ranking_table.csv');
+end
+
+% Save full results
+save('ecg_denoise_results_final.mat','results','compTable','T_rank_sorted','t','Fs','ecg_clean','ecg_noisy','acc');
+
+%% ---------------- Plots ----------------
+% Overview
+figure('Name','ECG overview','Units','normalized','Position',[0.05 0.1 0.9 0.8]);
+subplot(4,1,1); plot(t, ecg_clean); title('Clean ECG (ground truth or surrogate)'); xlabel('Time (s)');
+subplot(4,1,2); plot(t, ecg_noisy); title('Noisy ECG (input)'); xlabel('Time (s)');
+ax3 = subplot(4,1,3); hold on; if isfield(results,'RLS'); plot(t, results.RLS.y); end; title('Denoised example (RLS)'); xlabel('Time (s)');
+ax4 = subplot(4,1,4); hold on; if isfield(results,'Kalman'); plot(t, results.Kalman.y); end; title('Denoised example (Kalman)'); xlabel('Time (s)');
+linkaxes([ax3 ax4],'x');
+saveas(gcf,'ecg_overview_final.png');
+
+% Zoomed section
+zoomW = round(1*Fs); startInd = round(3*Fs);
+if startInd+zoomW-1 > length(t), startInd = 1; end
+inds = startInd:(startInd+zoomW-1);
+figure('Name','Zoomed comparison final','Units','normalized','Position',[0.1 0.15 0.8 0.6]);
+plot(t(inds), ecg_clean(inds),'k','LineWidth',1.2); hold on;
+plot(t(inds), ecg_noisy(inds),'Color',[0.7 0.7 0.7]);
+legendEntries = {'clean','noisy'};
+if isfield(results,'LMS'), plot(t(inds), results.LMS.y(inds)); legendEntries{end+1} = 'LMS'; end
+if isfield(results,'NLMS'), plot(t(inds), results.NLMS.y(inds)); legendEntries{end+1} = 'NLMS'; end
+if isfield(results,'PNLMS'), plot(t(inds), results.PNLMS.y(inds)); legendEntries{end+1} = 'PNLMS'; end
+if isfield(results,'IPNLMS'), plot(t(inds), results.IPNLMS.y(inds)); legendEntries{end+1} = 'IPNLMS'; end
+if isfield(results,'RLS'), plot(t(inds), results.RLS.y(inds)); legendEntries{end+1} = 'RLS'; end
+if isfield(results,'Kalman'), plot(t(inds), results.Kalman.y(inds)); legendEntries{end+1} = 'Kalman'; end
+if isfield(results,'EEMD'), plot(t(inds), results.EEMD.y(inds),'--'); legendEntries{end+1} = 'EEMD'; end
+legend(legendEntries,'Location','bestoutside');
+title('Zoomed (1s) comparison (final)'); xlabel('Time (s)');
+saveas(gcf,'ecg_zoomed_comparison_final.png');
+
+% Composite score bar
+figure('Name','Algorithm composite scores','Units','normalized','Position',[0.2 0.2 0.6 0.4]);
+barh(flip(composite)); hold on;
+yticks(1:length(composite));
+yticklabels(flip(alg_names_rank));
+xlabel('Composite score (higher is better)');
+title('Algorithm ranking (higher = better)');
+grid on;
+saveas(gcf,'algorithm_ranking_final.png');
+
+fprintf('\nAll outputs saved: ecg_denoise_results_final.mat, comparison_table.csv, ranking_table.csv and PNG figures.\n');
+
+%% ================= Helper functions =================
+
+function [ecg, acc, Fs_out, time_vec, clean_ref] = my_load_ecg_acc(filename, defaultFs)
+    % loads ecg and acc (and optional clean reference) from .mat, .csv, .txt
+    [~,~,ext] = fileparts(filename);
+    Fs_out = defaultFs; time_vec = []; ecg = []; acc = []; clean_ref = [];
+    switch lower(ext)
+        case '.mat'
+            S = load(filename);
+            vars = fieldnames(S);
+            % try common variable names
+            cand_ecg = {'ecg','ecg_raw','ecg_noisy','signal','lead1','leadI'};
+            cand_acc = {'acc','accel','accel_z','accel_x','acc_x','accelerometer'};
+            cand_fs = {'Fs','fs','sampling_rate'};
+            for i=1:length(cand_ecg), if isfield(S,cand_ecg{i}), ecg = S.(cand_ecg{i}); end; end
+            for i=1:length(cand_acc), if isfield(S,cand_acc{i}), acc = S.(cand_acc{i}); end; end
+            for i=1:length(cand_fs), if isfield(S,cand_fs{i}), Fs_out = S.(cand_fs{i}); end; end
+            if isfield(S,'time'), time_vec = S.time; end
+            if isfield(S,'t'), time_vec = S.t; end
+            % optional clean reference
+            if isfield(S,'ecg_clean'), clean_ref = S.ecg_clean; end
+            if isfield(S,'clean'), clean_ref = S.clean; end
+            % fallback: pick first numeric vector as ecg and second as acc
+            if isempty(ecg) || isempty(acc)
+                numericVars = {};
+                for i=1:length(vars)
+                    v = S.(vars{i});
+                    if isnumeric(v) && isvector(v)
+                        numericVars{end+1} = vars{i}; %#ok<AGROW>
+                    end
+                end
+                if isempty(ecg) && ~isempty(numericVars), ecg = S.(numericVars{1}); end
+                if isempty(acc) && numel(numericVars)>=2, acc = S.(numericVars{2}); end
+            end
+        case '.csv'
+            T = readtable(filename);
+            varnames = T.Properties.VariableNames;
+            if any(strcmpi(varnames,'time')), time_vec = T.time; end
+            if any(strcmpi(varnames,'ecg')), ecg = T.ecg; end
+            if any(strcmpi(varnames,'acc')), acc = T.acc; end
+            if isempty(ecg) || isempty(acc)
+                % pick first two numeric columns
+                numericCols = varfun(@isnumeric, T, 'OutputFormat','uniform');
+                idx = find(numericCols);
+                if numel(idx) >= 2
+                    ecg = T{:,idx(1)}; acc = T{:,idx(2)};
+                end
+            end
+        case '.txt'
+            M = dlmread(filename);
+            if size(M,2) >= 2
+                ecg = M(:,1); acc = M(:,2);
+                if size(M,2) >= 3
+                    time_vec = M(:,3);
+                    Fs_out = 1/mean(diff(time_vec));
+                end
+            end
+        otherwise
+            error('Unsupported file type: %s', ext);
+    end
+    if isempty(ecg)
+        error('ECG signal not found in file. Make sure variable/column name includes ''ecg'' or provide file with ecg and acc.');
+    end
+    if isempty(acc)
+        warning('Accelerometer not found. Reference-based adaptive methods may perform poorly.');
+        acc = zeros(size(ecg));
+    end
+    ecg = double(ecg(:)); acc = double(acc(:));
+    if isempty(time_vec)
+        time_vec = (0:length(ecg)-1)'/Fs_out;
+    end
+end
+
+function y = my_resample_vector(x, targetLen)
+    % simple resample by linear interpolation to target length
+    oldLen = length(x);
+    if oldLen == targetLen, y = x; return; end
+    xi = linspace(1, oldLen, targetLen);
+    y = interp1(1:oldLen, x(:), xi(:), 'linear', 'extrap');
+end
+
+function [ecg_clean, ecg_noisy, acc, t] = my_synthetic_ecg_with_motion(Fs, dur)
+
+    % Load real ECG dataset
+   D = readmatrix('ecgdata.csv');
+    raw_ecg = D(:,1);
+    raw_ecg = raw_ecg - mean(raw_ecg);
+
+    % Resample to requested Fs and duration
+    targetN = round(Fs*dur);
+    raw_ecg = my_resample_vector(raw_ecg, targetN);
+    t = (0:targetN-1)'/Fs;
+
+    % Clean ECG morphology extracted from real data
+    ecg_band = my_bandpass(raw_ecg, [0.5 40], Fs);
+    ecg_clean = medfilt1(ecg_band, round(0.05*Fs));
+    ecg_clean = ecg_clean / (max(abs(ecg_clean))+eps);
+
+    % Motion artifact generation
+    ma = zeros(targetN,1);
+    for k=1:8
+        c = rand*dur;
+        w = 0.3 + 0.6*rand;
+        idx = (t>=c & t<=c+w);
+        lf = my_lowpass(randn(sum(idx),1), 6, Fs);
+        ma(idx) = ma(idx) + (0.6+rand)*lf.*hann(sum(idx));
+    end
+    ma = my_lowpass(ma,6,Fs);
+
+    % Power-line noise
+    pli = 0.03*sin(2*pi*50*t);
+
+    % Final noisy ECG
+   % Nonstationary motion coupling
+beta = 0.6 + 0.4*sin(2*pi*0.15*t + 2*pi*rand);
+
+ecg_noisy = ecg_clean + beta.*ma + pli + 0.02*randn(targetN,1);
+
+
+    % ACC from motion (physically correct reference)
+   % Time-varying mixing between motion and ECG
+mix = 0.3 + 0.7*sin(2*pi*0.2*t + 2*pi*rand);
+
+acc = mix .* ma + 0.4*randn(targetN,1);
+acc = my_lowpass(acc,6,Fs);
+
+    acc = acc - mean(acc);
+    acc = acc/(std(acc)+eps);
+end
+
+
+function y = my_gpulse(t, center, width)
+    sigma = width/2.3548;
+    y = exp(-(t-center).^2/(2*sigma^2));
+end
+
+function y = my_lowpass(x, fc, Fs)
+    if fc <= 0 || fc >= Fs/2
+        y = x; return;
+    end
+    [b,a] = butter(4, fc/(Fs/2));
+    y = filtfilt(b,a,x);
+end
+
+function y = my_bandpass(x, band, Fs)
+    f1 = band(1); f2 = band(2);
+    if f1 <= 0, f1 = 0.01; end
+    if f2 >= Fs/2, f2 = Fs/2-0.01; end
+    [b,a] = butter(4, [f1 f2]/(Fs/2));
+    y = filtfilt(b,a,x);
+end
+
+function [w_out, y, e] = my_lms_adaptive(d, x_ref, L, mu)
+    N = length(d);
+    w = zeros(L,1); y = zeros(N,1); e = zeros(N,1); xbuf = zeros(L,1);
+    for n=1:N
+        xbuf = [x_ref(n); xbuf(1:end-1)];
+        y(n) = w'*xbuf;
+        e(n) = d(n) - y(n);
+        w = w + mu*e(n)*xbuf;
+    end
+    w_out = w;
+end
+
+function [y, w_out] = my_nlms_adaptive(d, x_ref, L, mu, eps_n)
+    N = length(d);
+    w = zeros(L,1); y = zeros(N,1); xbuf = zeros(L,1);
+    for n=1:N
+        xbuf = [x_ref(n); xbuf(1:end-1)];
+        y(n) = w'*xbuf;
+        e = d(n) - y(n);
+        normx = xbuf'*xbuf + eps_n;
+        w = w + (mu/normx)*e*xbuf;
+    end
+    w_out = w;
+end
+
+function [y, w_out] = my_pnlms_adaptive(d, x_ref, L, mu, rho, delta)
+    N = length(d);
+    w = zeros(L,1); y = zeros(N,1); xbuf = zeros(L,1);
+    for n=1:N
+        xbuf = [x_ref(n); xbuf(1:end-1)];
+        y(n) = w'*xbuf;
+        e = d(n) - y(n);
+        absw = abs(w);
+        maxw = max(absw);
+        psi = max(delta, max(maxw, absw));
+        g = psi / (mean(psi) + eps);
+        G = diag(g + rho*ones(L,1));
+        denom = xbuf'*(G*xbuf) + eps;
+        w = w + (mu/denom) * G * xbuf * e;
+    end
+    w_out = w;
+end
+
+function [y, w_out] = my_ipnlms_adaptive(d, x_ref, L, mu, alpha, rho, delta)
+    N = length(d);
+    w = zeros(L,1); y = zeros(N,1); xbuf = zeros(L,1);
+    for n=1:N
+        xbuf = [x_ref(n); xbuf(1:end-1)];
+        y(n) = w'*xbuf;
+        e = d(n) - y(n);
+        absw = abs(w);
+        denom_w = sum(absw) + eps;
+        gl = (1 - alpha)/(2*L) + (1 + alpha)*(absw)./(2*denom_w + eps);
+        gl = max(gl, delta);
+        g = gl / (mean(gl) + eps);
+        G = diag(g + rho*ones(L,1));
+        denom = xbuf'*(G*xbuf) + eps;
+        w = w + (mu/denom) * G * xbuf * e;
+    end
+    w_out = w;
+end
+
+function [y, w_out] = my_rls_adaptive(d, x_ref, L, lambda, delta)
+    N = length(d);
+    w = zeros(L,1);
+    P = (1/delta)*eye(L);
+    y = zeros(N,1); xbuf = zeros(L,1);
+    for n=1:N
+        xbuf = [x_ref(n); xbuf(1:end-1)];
+        y(n) = w'*xbuf;
+        k = (P*xbuf) / (lambda + xbuf'*P*xbuf);
+        e = d(n) - y(n);
+        w = w + k*e;
+        P = (P - k*xbuf'*P)/lambda;
+    end
+    w_out = w;
+end
+
+function [y, w_out] = my_kalman_adaptive(d, x_ref, L, q_var, r_var)
+    N = length(d);
+    w = zeros(L,1); P = eye(L)*1; Q = q_var*eye(L); R = r_var;
+    y = zeros(N,1); xbuf = zeros(L,1);
+    for n=1:N
+        xbuf = [x_ref(n); xbuf(1:end-1)];
+        P = P + Q;
+        y(n) = w'*xbuf;
+        S = xbuf'*P*xbuf + R;
+        K = (P*xbuf)/S;
+        e = d(n) - y(n);
+        w = w + K*e;
+        P = P - K*xbuf'*P;
+    end
+    w_out = w;
+end
+
+function y_out = my_simple_eemd_denoise(x_noisy, Fs, ensembles, noise_level)
+    N = length(x_noisy);
+    use_builtin = exist('emd','file')==2;
+    recon_bank = zeros(N,ensembles);
+    for k=1:ensembles
+        wn = noise_level*randn(N,1);
+        x_ens = x_noisy + wn;
+        try
+            if use_builtin
+                imf = emd(x_ens);
+                numIMF = size(imf,2);
+                medfreqs = zeros(numIMF,1);
+                for j=1:numIMF
+                    Xf = abs(fft(imf(:,j)));
+                    f = (0:N-1)*(Fs/N);
+                    medfreqs(j) = sum(f'.*Xf)/(sum(Xf)+eps);
+                end
+                keep = medfreqs > 1.0;
+                if any(keep)
+                    recon = sum(imf(:,keep),2);
+                else
+                    recon = my_bandpass(x_ens, [0.5 40], Fs);
+                end
+            else
+                recon = my_bandpass(x_ens, [0.5 40], Fs);
+            end
+        catch
+            recon = my_bandpass(x_ens, [0.5 40], Fs);
+        end
+        recon_bank(:,k) = recon;
+    end
+    y_out = mean(recon_bank,2);
+end
